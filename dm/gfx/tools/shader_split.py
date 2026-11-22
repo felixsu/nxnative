@@ -3114,6 +3114,44 @@ def raw_shaders(d, label, known=()):
         if why: print(f'[RED] {label} control section @{c:#x}: {why}; left out', flush=True)
     return out
 
+def nro_shaders(d, label, found):
+    """A module the game loads at run time (nn::ro), an NRO captured from a boot (boot_nros) or loose in the RomFS: read as main is, its containers (scan_blob) and then its bare control sections
+    (raw_shaders), leaving out those the containers gave. Village in the Shade's NmplDLL.nro (the Nmpl engine, loose at the RomFS root) holds 1,149 shaders, 918 distinct, as bare sections its code
+    hands to NVN itself, in no GLSLC output or BNSH file; a scan for containers alone found none of them"""
+    mine = len(found)
+    scan_blob(d, label, found)
+    found += raw_shaders(d, label, {c[:struct.unpack_from('<I', c, 0x20)[0]] for _, _, c, _ in found[mine:]})   # compared at their own length, as raw_shaders reads them
+
+FAFULLFS, NMPL_FX = b'FAFULLFS', b'NMPL_FX_SHADER'
+def fafullfs_shaders(path, label, out):
+    """The Nmpl engine's archives (Village in the Shade, SDK 20): data/<kind>_1_00.dat are 'FAFULLFS' files, u32 entry count at +8 and u64 index offset at +0x20; the index is 0x30-byte entries
+    {u64 name hash, u64, u64, u64 size, u64 offset, u64 time}, the entry names after it. Only shader_1_00.dat holds shaders: its data/shader/*.fxdat entries are 'NMPL_FX_SHADER02' records of one
+    program, a vertex and a pixel shader as bare GLSLC sections, each control section followed at its own length (16-byte aligned) by the code area of the length it gives (+0x704); between them sit
+    the program's names (TEXCOORD0 …). The engine's built-in shaders are in NmplDLL.nro (boot_nros, raw_shaders). The other archives (textures, audio, maps up to 1.7 GB) are not read, only the
+    first bytes of each entry, so a split does not read 4 GB to find 648 KB. Both stages of a record are labelled as one variation (var_pairs pairs them)"""
+    with open(path, 'rb') as f:
+        h = f.read(0x28)
+        n, at = struct.unpack_from('<I', h, 8)[0], struct.unpack_from('<Q', h, 0x20)[0]
+        f.seek(at); ix = f.read(n * 0x30)
+        if len(ix) < n * 0x30: red(f'{label}: FAFULLFS index of {n} entries at {at:#x} runs past the end of the file')
+        for i in range(n):
+            size, off = struct.unpack_from('<QQ', ix, i * 0x30 + 0x18)
+            f.seek(off)
+            if f.read(len(NMPL_FX)) != NMPL_FX: continue
+            f.seek(off); r = f.read(size)
+            where, got = f'{label}#NMPL@{off:#x}#var0', 0
+            for m in re.finditer(re.escape(CTL_MAGIC), r):
+                c = m.start()
+                if c & 3 or c + 0x708 > len(r): continue
+                nctl, n_code = struct.unpack_from('<I', r, c + 0x20)[0], struct.unpack_from('<I', r, c + 0x704)[0]
+                k = (c + nctl + 15) & ~15
+                ctl, code = r[c:c + nctl], r[k:k + n_code]
+                st = glslc_stage(ctl, code) if len(code) == n_code and CTL_MAGIC not in code else None
+                why = check(label, st, ctl, code) if st else 'no code area of its length right after it'
+                if why: print(f'[RED] {where} control section @{c:#x}: {why}; left out', flush=True); continue
+                out.append((where, st, ctl, code)); got += 1
+            if not got: print(f'[RED] {where}: an {r[:16].decode(errors="replace")} record with no shader read from it', flush=True)
+
 TTCZ, TTCN = b'ZCTT', b'NCTT'
 def ttcz_chunks(d, at=0):
     """A Telltale 'ZCTT' block (a .ttarch2, or an entry of an 'NCTT' one): 'ZCTT', u32 version 0x10000, u32 chunk count n, then n + 1 u64 chunk offsets from the block's start (the first is the
@@ -4392,6 +4430,9 @@ def scan_file_in(args):
     if head[:4] == NLG_DICT:
         nlg_shaders(path, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:8] == FAFULLFS:   # an Nmpl archive (fafullfs_shaders): only its NMPL_FX_SHADER entries are read
+        fafullfs_shaders(path, '/' + rel, found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] in (TTCZ, TTCN):   # a Telltale .ttarch2 (ttarch2_shaders): only its effect pack holds shaders
         with open(path, 'rb') as f: found += ttarch2_shaders(f.read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -4542,6 +4583,9 @@ def scan_file_in(args):
         with open(path, 'rb') as f: d = f.read()
     if d[:4] == b'SHN!' or d[:8] == CIVBSF:
         scan_blob(d, '/' + rel, found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if d[0x10:0x14] == b'NRO0':   # a module the game loads at run time, loose in the RomFS: read as main is (nro_shaders)
+        nro_shaders(d, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if d[:3] == b'\x1f\x8b\x08':   # standard gzip: Skyward Sword HD's Shaders.arc.gz wraps paired GLSLC outputs
         d = ungzip(d, '/' + rel); head = d[:16]   # later format probes inspect decoded bytes, not the gzip timestamp
@@ -4732,8 +4776,7 @@ def main():
         found += raw_shaders(img, 'main' + ('@' + tag if tag else ''), {c[:struct.unpack_from('<I', c, 0x20)[0]] for _, _, c, _ in found})   # compared at their own length, as raw_shaders reads them
         # NROs the game decodes at run time (Mario Tennis Fever: main is a boot stub, and the real code's data holds 11 shaders the game draws its UI and sky with): scanned like main, as no RomFS file holds them
         if not i:
-            for n in boot_nros():
-                scan_blob(open(n, 'rb').read(), f'main/{os.path.basename(n)}', found)
+            for n in boot_nros(): nro_shaders(open(n, 'rb').read(), f'main/{os.path.basename(n)}', found)
         # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
         # calls glslcCompile in a module it loads (Fire Emblem: Three Houses; profile_guess.py shader_sources). Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it
         cap = os.environ.get('DM_GLSLC_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'glslc_capture')
