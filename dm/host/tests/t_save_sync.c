@@ -23,6 +23,8 @@
 //        device's save newer: not sent that session, the next start sends it and keeps the cloud's in the backups ("cloud")
 //   (17) the cloud shows no save though this device synced one there (removed, wrong folder, or iCloud has not listed it yet): with a front end that asks,
 //        the report says conflict=1 cloud=0, the start sends nothing, nor does the launcher after the host; the player's local:none sends; no front end sends, as before
+//   (18) DM_SAVE_SYNC as an http(s) URL (a game library's save store): the cloud's file is <url>/<title ID>/save.dmsync, fetched and sent through
+//        front_save_sync_http (a stub here standing in for save_sync_http.c's libcurl), and nothing is made on disk for it; a store that does not answer reads as -1
 #include "../hle_fs.c"
 #include <ctype.h>
 #include <sys/wait.h>
@@ -104,6 +106,34 @@ static int backups(const char *save, const char *side) {   // how many backups o
     while (d && (e = readdir(d))) { size_t l = strlen(e->d_name); k += l > sl && e->d_name[l - sl - 1] == ' ' && !strcmp(e->d_name + l - sl, side); }
     if (d) closedir(d);
     return k;
+}
+
+// front_save_sync_http for (18): http://library.test/<path> is <g_store>/<path>; with <g_store>/down there the store does not answer. Every call is appended to <g_store>/calls
+static char g_store[1200];
+static int copy_file(const char *from, const char *to) {
+    FILE *a = fopen(from, "rb"); if (!a) return -1;
+    FILE *b = fopen(to, "wb"); if (!b) { fclose(a); return -1; }
+    char buf[4096]; size_t k; int r = 0;
+    while ((k = fread(buf, 1, sizeof buf, a))) if (fwrite(buf, 1, k, b) != k) r = -1;
+    fclose(a); if (fclose(b)) r = -1;
+    return r;
+}
+int front_save_sync_http(int put, const char *url, const char *local) {
+    char at[1600], log[1300], dir[1600]; const char *pre = "http://library.test/";
+    snprintf(log, sizeof log, "%s/calls", g_store);
+    FILE *f = fopen(log, "a"); if (f) { fprintf(f, "%s %s\n", put ? "PUT" : "GET", url); fclose(f); }
+    snprintf(at, sizeof at, "%s/down", g_store);
+    if (exists(at) || strncmp(url, pre, strlen(pre))) return put ? 0 : -1;
+    snprintf(at, sizeof at, "%s/%s", g_store, url + strlen(pre));
+    if (!put) return !exists(at) ? 0 : copy_file(at, local) ? -1 : 1;
+    snprintf(dir, sizeof dir, "%s", at); *strrchr(dir, '/') = 0; mkd(dir);
+    return !copy_file(local, at);
+}
+static int calls_have(const char *line) {   // a call the stub logged
+    char log[1300], l[1600]; snprintf(log, sizeof log, "%s/calls", g_store);
+    FILE *f = fopen(log, "r"); int hit = 0; if (!f) return 0;
+    while (!hit && fgets(l, sizeof l, f)) { l[strcspn(l, "\n")] = 0; hit = !strcmp(l, line); }
+    fclose(f); return hit;
 }
 
 int main(void) {
@@ -450,6 +480,24 @@ int main(void) {
         CHECK(run(W, cloud6, NULL, NULL, "local:none", NULL, READABLE) == 0 && cloud_has(cf6, root, "game.dat", "w3"), "the player's local:none: this device's save is sent");
         unlink(hid); unlink(cf6); put(p, "w4");   // the cloud's file removed for good, and this device saves on
         CHECK(session(W, cloud6, NULL, NULL) == 0 && cloud_has(cf6, root, "game.dat", "w4"), "no front end asks: sent, as before");
+    }
+    printf("(18) a save store over http(s)\n");
+    {   char X[1200], Y[1200], sf[1500], get[1600], ln[2048]; const char *url = "http://library.test/api/saves";
+        snprintf(g_store, sizeof g_store, "%s/store", root); mkd(g_store);
+        snprintf(X, sizeof X, "%s/mac9/save", root); snprintf(Y, sizeof Y, "%s/mac10/save", root); mkd(X); mkd(Y);
+        snprintf(sf, sizeof sf, "%s/api/saves/%s/save.dmsync", g_store, id); snprintf(get, sizeof get, "GET %s/%s/save.dmsync", url, id);
+        CHECK(!save_sync_report(X, DM_GAME_ID, url, 0, ln, sizeof ln) && strstr(ln, "sync=1 cloud=0 ") && calls_have(get), "the report asks the store for <url>/<title ID>/save.dmsync: none yet (%s)", ln);
+        snprintf(p, sizeof p, "%s/game.dat", X); put(p, "x1");
+        CHECK(session(X, url, NULL, NULL) == 0 && cloud_has(sf, root, "game.dat", "x1"), "Mac X's save goes to the store");
+        snprintf(q, sizeof q, "PUT %s/%s/save.dmsync", url, id);
+        CHECK(calls_have(q) && !exists("http:") && !exists("http:/library.test"), "sent with a PUT; no folder is made for the URL");
+        CHECK(session(Y, url, "game.dat", "y2") == 0 && cloud_has(sf, root, "game.dat", "y2"), "Mac Y brings it in, plays on and sends y2");
+        snprintf(q, sizeof q, "%s/down", g_store); put(q, "");
+        CHECK(!save_sync_report(X, DM_GAME_ID, url, 0, ln, sizeof ln) && strstr(ln, "sync=1 cloud=-1 "), "the store does not answer: the report says the cloud was not read (%s)", ln);
+        CHECK(run(X, url, "game.dat", "x3", "offline", NULL, READABLE) == NOT_SENT && cloud_has(sf, root, "game.dat", "y2"), "played offline: nothing sent, Y's progress stays");
+        unlink(q);
+        CHECK(!save_sync_report(X, DM_GAME_ID, url, 0, ln, sizeof ln) && strstr(ln, "cloud=1 ") && strstr(ln, "conflict=1"), "back up: both changed, a conflict to ask about (%s)", ln);
+        CHECK(run(X, url, NULL, NULL, choice_of("local", sf), NULL, READABLE) == 0 && cloud_has(sf, root, "game.dat", "x3"), "the player keeps X's: it replaces Y's in the store");
     }
     printf("== save sync: %d checks, %d failed ==\n", checks, fails);
     if (!fails) { char c[1200]; snprintf(c, sizeof c, "rm -rf '%s'", root); system(c); }

@@ -1,4 +1,5 @@
-// Saves through a cloud folder (iCloud Drive): see save_sync.h. Plain C on system calls and CommonCrypto only, so the Mac launcher links it as the host does (dm/mac/pack_app.py).
+// Saves through a cloud folder (iCloud Drive), or a game library's save store over http(s): see save_sync.h. Plain C on system calls and CommonCrypto only, so the Mac launcher
+// links it as the host does (dm/mac/pack_app.py); the http part is save_sync_http.c (libcurl), which both link beside it.
 // A packed save (<folder>/<title ID>/save.dmsync), little-endian:
 //   header  "DMSYNC1\n", u32 version (1), u32 entries, 32 hex digits of the hash, i64 saved, char title[24], char device[64]
 //   entry   u8 type (1 folder, 2 file), u8 0, u16 path length, u16 guest-name length, u16 0, u64 size, i64 mtime; the path (save/... or save_device/...), the guest name, the contents
@@ -56,6 +57,8 @@ static int names_of(const char *dir, char ***out, size_t *count) {
     if (n) qsort(v, n, sizeof *v, by_name);
     *out = v; *count = n; return 0;
 }
+
+static int is_url(const char *p) { return !strncasecmp(p, "http://", 7) || !strncasecmp(p, "https://", 8); }   // DM_SAVE_SYNC naming a save store over http(s), not a folder
 
 static int mkdirs(const char *path) {   // mkdir -p
     char p[PATH_MAX]; if (snprintf(p, sizeof p, "%s", path) >= (int)sizeof p) return -1;
@@ -576,7 +579,7 @@ static int send_save(const char *save, const char *title, const char *cloud) {
         goto done;
     }
     snprintf(dir, sizeof dir, "%s", cloud); *strrchr(dir, '/') = 0;
-    if (mkdirs(dir) || front_save_sync_store(packed, cloud) != 1) { SRED("sending to %s failed (errno=%d)", cloud, errno); goto done; }
+    if ((!is_url(cloud) && mkdirs(dir)) || front_save_sync_store(packed, cloud) != 1) { SRED("sending to %s failed (errno=%d)", cloud, errno); goto done; }
     write_base(save, mine.hash); ok = 1;
     when(mine.saved, t, sizeof t);
     SLOG("sent: %d files, saved %s, to %s", mine.files, t, cloud);
@@ -769,7 +772,14 @@ int save_sync_after_exit(const char *save, const char *title) {   // save: DM_SA
 }
 
 // ---------- the platform's parts: these defaults are plain file copies, which the Mac's iCloud Drive takes (it downloads a file a read asks for) ----------
+// A cloud that is an http(s) URL goes to front_save_sync_http (save_sync_http.c); a program that does not link it cannot reach one
+__attribute__((weak)) int front_save_sync_http(int put, const char *url, const char *local) {
+    (void)local; SRED("%s: this program cannot %s an http(s) cloud (no save_sync_http.c linked)", url, put ? "send to" : "read");
+    errno = ENOTSUP; return put ? 0 : -1;
+}
+
 __attribute__((weak)) int front_save_sync_fetch(const char *cloud, const char *local) {
+    if (is_url(cloud)) return front_save_sync_http(0, cloud, local);
     int in = open(cloud, O_RDONLY); if (in < 0) return errno == ENOENT ? 0 : -1;
     int out = open(local, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (out < 0) { close(in); return -1; }
     int r = copy_fd(in, out); close(in);
@@ -780,6 +790,7 @@ __attribute__((weak)) int front_save_sync_fetch(const char *cloud, const char *l
 
 // Written beside the cloud file under a .nosync name (iCloud Drive does not upload those) and renamed over it: iCloud sees one whole new file
 __attribute__((weak)) int front_save_sync_store(const char *local, const char *cloud) {
+    if (is_url(cloud)) return front_save_sync_http(1, cloud, local);
     char part[PATH_MAX]; snprintf(part, sizeof part, "%s.%d.nosync", cloud, (int)getpid());
     int in = open(local, O_RDONLY); if (in < 0) return 0;
     int out = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (out < 0) { close(in); return 0; }

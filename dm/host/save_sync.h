@@ -10,6 +10,8 @@
 // with one, the chosen save wins. Without DM_SAVE_SYNC_CHOICE the newer one wins. Only the start decides: a send replaces a cloud save only when it is no save, the
 // one last synced, damaged, or the one the start chose against. A cloud that changed since (or that the start could not read) waits for the next start.
 // Every save this replaces, here or in the cloud, is kept first in <DM_SAVE>-backups/<date> <side>; the newest 10 of each side stay.
+// On the Mac, DM_SAVE_SYNC may instead be an http(s) URL: a save store such as a game library's (<url>/<title ID>/save.dmsync answers GET with the file, 404 for none,
+// and takes a PUT of a new one). Everything above holds the same; only the two platform calls below go over http (front_save_sync_http, save_sync_http.c).
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -67,5 +69,8 @@ int save_sync_after_exit(const char *save, const char *title);   // the Mac laun
 int front_save_sync_fetch(const char *cloud, const char *local);
 // Puts a local file at the cloud path, replacing the file there as a whole. 1 = done
 int front_save_sync_store(const char *local, const char *cloud);
+// The two above for a cloud that is an http(s) URL (the defaults hand it over): put = 0 GETs `url` into `local` (fetch's answers: 1, 0 for HTTP 404, -1), put = 1 PUTs
+// `local` to `url` (store's: 1 = a 2xx answer). dm/host/save_sync_http.c gives it with libcurl to the host and the Mac launcher; the weak default reaches nothing
+int front_save_sync_http(int put, const char *url, const char *local);
 // Clones the committed save folder `dir` to `to` while no Commit can swap it (hle_fs.c takes its lock; the default, with no host running, does not need one). 0 on success
 int dm_fs_clone_committed(const char *dir, const char *to);
